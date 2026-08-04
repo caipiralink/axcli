@@ -4,9 +4,10 @@
 //! direct access to the accessibility tree.
 
 use std::ptr::NonNull;
+use std::time::{Duration, Instant};
 
 use objc2_application_services::{AXError, AXUIElement};
-use objc2_core_foundation::{CFArray, CFIndex, CFRetained, CFString, CFType, Type};
+use objc2_core_foundation::{CFArray, CFBoolean, CFIndex, CFRetained, CFString, CFType, Type};
 
 pub use objc2_application_services::AXIsProcessTrusted;
 
@@ -492,6 +493,90 @@ fn find_all_inner(
     }
 }
 
+/// Opt a Chromium/Electron app into exposing its web-content accessibility
+/// tree, the way VoiceOver does.
+///
+/// Without this, `AXChildren` on such an app bottoms out at the native window
+/// chrome and no web content is reachable. Two attributes matter:
+///
+/// * `AXManualAccessibility` — the modern, side-effect-free Electron opt-in.
+/// * `AXEnhancedUserInterface` — the legacy flag some builds expose instead.
+///
+/// Both are set unconditionally because Chromium acts on the *attempt* while
+/// still reporting an `AXError` (commonly `kAXErrorAttributeUnsupported` or
+/// `kAXErrorNotImplemented`), so the return codes say nothing about whether the
+/// tree will materialize. Native Cocoa apps reject both and are unaffected.
+///
+/// The renderer builds the tree asynchronously over IPC, so a walk that starts
+/// immediately can still see only the chrome. Callers that need the tree right
+/// away should follow up with [`settle_web_accessibility`].
+pub fn enable_web_accessibility(element: &AXUIElement) {
+    let yes = CFBoolean::new(true);
+    set_attr_value(element, "AXManualAccessibility", yes);
+    set_attr_value(element, "AXEnhancedUserInterface", yes);
+}
+
+/// Wait for a Chromium/Electron renderer to publish its accessibility tree.
+///
+/// Polls until the app exposes an `AXWebArea` descendant or `timeout` elapses.
+/// Returns true once web content is visible.
+pub fn settle_web_accessibility(element: &AXUIElement, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if has_web_area(element, 0) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Depth-limited probe for an `AXWebArea` node. The web area sits just a few
+/// levels below the window in Chromium, so a shallow bound keeps this cheap.
+fn has_web_area(element: &AXUIElement, depth: usize) -> bool {
+    if depth > WEB_AREA_PROBE_DEPTH {
+        return false;
+    }
+    if attr_string(element, "AXRole").as_deref() == Some("AXWebArea") {
+        return true;
+    }
+    children(element)
+        .iter()
+        .any(|child| has_web_area(child, depth + 1))
+}
+
+/// Heuristic: does this app render through Chromium's views layer?
+///
+/// Chromium tags its *native* window chrome with `AXDOMClassList` entries such
+/// as `RootView` and `ClientView`, which appear as soon as the window exists and
+/// well before any web content does. Native Cocoa apps expose no such classes,
+/// so this distinguishes "web content is still loading" from "there is no web
+/// content" without waiting on the latter.
+fn looks_chromium(element: &AXUIElement, depth: usize) -> bool {
+    if depth > CHROMIUM_PROBE_DEPTH {
+        return false;
+    }
+    if attr_string_list(element, "AXDOMClassList")
+        .iter()
+        .any(|class| CHROMIUM_VIEW_CLASSES.contains(&class.as_str()))
+    {
+        return true;
+    }
+    children(element)
+        .iter()
+        .any(|child| looks_chromium(child, depth + 1))
+}
+
+const WEB_AREA_PROBE_DEPTH: usize = 12;
+const CHROMIUM_PROBE_DEPTH: usize = 4;
+const CHROMIUM_VIEW_CLASSES: [&str; 3] = ["RootView", "NonClientView", "ClientView"];
+
+/// How long to wait for a Chromium renderer to publish its tree. Observed
+/// settle times are well under 100ms; the ceiling only matters for a busy app.
+const WEB_ACCESSIBILITY_SETTLE: Duration = Duration::from_millis(1500);
+
 // ---------------------------------------------------------------------------
 // AXNode — ergonomic wrapper
 // ---------------------------------------------------------------------------
@@ -501,8 +586,19 @@ pub struct AXNode(pub CFRetained<AXUIElement>);
 
 impl AXNode {
     /// Create a node for an application by PID.
+    ///
+    /// Chromium/Electron apps ship their web-content accessibility tree off and
+    /// only build it once an assistive client asks for it. This opts in via
+    /// [`enable_web_accessibility`] and, for apps that look Chromium-backed,
+    /// waits for the renderer to publish the tree so the very first command
+    /// sees web content instead of bare window chrome.
     pub fn app(pid: i32) -> Self {
-        Self(unsafe { AXUIElement::new_application(pid) })
+        let element = unsafe { AXUIElement::new_application(pid) };
+        enable_web_accessibility(&element);
+        if !has_web_area(&element, 0) && looks_chromium(&element, 0) {
+            settle_web_accessibility(&element, WEB_ACCESSIBILITY_SETTLE);
+        }
+        Self(element)
     }
 
     /// Create a node from a retained element.
