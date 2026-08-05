@@ -1839,6 +1839,138 @@ pub fn is_window_visible_at(window_id: u32, x: f64, y: f64) -> Result<bool, Stri
     Err(format!("window {window_id} not found on screen"))
 }
 
+/// Find the on-screen CGWindowID owned by `pid` whose bounds match `frame`.
+///
+/// `_AXUIElementGetWindow` can report a window that belongs to a *helper*
+/// process rather than the one that will receive our events. Microsoft Teams
+/// is the motivating case: web content lives in a separate "Microsoft Teams
+/// WebView" process, so an element inside the page reports that process's
+/// off-screen window, while the window actually on screen belongs to the main
+/// application. Posting a mismatched (pid, window id) pair to
+/// `CGEventPostToPid` makes hit-testing fail silently.
+///
+/// Matching is done on the AX frame, which is expressed in the same top-left
+/// origin coordinate space as `kCGWindowBounds`.
+pub fn window_id_for_frame(pid: i32, frame: (f64, f64, f64, f64)) -> Option<u32> {
+    use std::ffi::c_void;
+    use objc2_core_foundation::{CFIndex, CFNumber, CFNumberType, CFString as CFS};
+    use objc2_core_graphics::{CGWindowListCopyWindowInfo, CGWindowListOption};
+
+    unsafe extern "C" {
+        fn CFDictionaryGetValue(dict: *const c_void, key: *const c_void) -> *const c_void;
+    }
+
+    let info = CGWindowListCopyWindowInfo(
+        CGWindowListOption::OptionOnScreenOnly | CGWindowListOption::ExcludeDesktopElements,
+        0,
+    )?;
+
+    let key_num = CFS::from_str("kCGWindowNumber");
+    let key_pid = CFS::from_str("kCGWindowOwnerPID");
+    let key_layer = CFS::from_str("kCGWindowLayer");
+    let key_alpha = CFS::from_str("kCGWindowAlpha");
+    let key_bounds = CFS::from_str("kCGWindowBounds");
+
+    let (fx, fy, fw, fh) = frame;
+
+    for i in 0..info.len() {
+        let dict_ptr = unsafe { info.as_opaque().value_at_index(i as CFIndex) };
+        if dict_ptr.is_null() {
+            continue;
+        }
+        let get_val = |key: &CFS| -> *const c_void {
+            unsafe { CFDictionaryGetValue(dict_ptr, key as *const CFS as *const c_void) }
+        };
+        let read_i64 = |ptr: *const c_void| -> Option<i64> {
+            if ptr.is_null() {
+                return None;
+            }
+            let num = unsafe { &*(ptr as *const CFNumber) };
+            let mut v: i64 = 0;
+            unsafe { num.value(CFNumberType(4), &mut v as *mut i64 as *mut _) };
+            Some(v)
+        };
+
+        if read_i64(get_val(&key_pid)) != Some(pid as i64) {
+            continue;
+        }
+        if read_i64(get_val(&key_layer)).unwrap_or(0) != 0 {
+            continue;
+        }
+
+        // Skip fully transparent overlays; Teams keeps one over its title bar.
+        let alpha_ptr = get_val(&key_alpha);
+        if !alpha_ptr.is_null() {
+            let num = unsafe { &*(alpha_ptr as *const CFNumber) };
+            let mut alpha: f64 = 1.0;
+            unsafe { num.value(CFNumberType(13), &mut alpha as *mut f64 as *mut _) };
+            if alpha <= 0.0 {
+                continue;
+            }
+        }
+
+        let bounds_ptr = get_val(&key_bounds);
+        if bounds_ptr.is_null() {
+            continue;
+        }
+        let (bx, by, bw, bh) = read_bounds_dict(bounds_ptr);
+
+        const TOLERANCE: f64 = 2.0;
+        if (bx - fx).abs() <= TOLERANCE
+            && (by - fy).abs() <= TOLERANCE
+            && (bw - fw).abs() <= TOLERANCE
+            && (bh - fh).abs() <= TOLERANCE
+        {
+            return read_i64(get_val(&key_num)).map(|v| v as u32);
+        }
+    }
+    None
+}
+
+/// Whether `window_id` is an on-screen window owned by `pid`.
+pub fn window_belongs_to_pid(window_id: u32, pid: i32) -> bool {
+    use std::ffi::c_void;
+    use objc2_core_foundation::{CFIndex, CFNumber, CFNumberType, CFString as CFS};
+    use objc2_core_graphics::{CGWindowListCopyWindowInfo, CGWindowListOption};
+
+    unsafe extern "C" {
+        fn CFDictionaryGetValue(dict: *const c_void, key: *const c_void) -> *const c_void;
+    }
+
+    let Some(info) = CGWindowListCopyWindowInfo(
+        CGWindowListOption::OptionOnScreenOnly | CGWindowListOption::ExcludeDesktopElements,
+        0,
+    ) else {
+        return false;
+    };
+
+    let key_num = CFS::from_str("kCGWindowNumber");
+    let key_pid = CFS::from_str("kCGWindowOwnerPID");
+
+    for i in 0..info.len() {
+        let dict_ptr = unsafe { info.as_opaque().value_at_index(i as CFIndex) };
+        if dict_ptr.is_null() {
+            continue;
+        }
+        let get_val = |key: &CFS| -> *const c_void {
+            unsafe { CFDictionaryGetValue(dict_ptr, key as *const CFS as *const c_void) }
+        };
+        let read_i64 = |ptr: *const c_void| -> Option<i64> {
+            if ptr.is_null() {
+                return None;
+            }
+            let num = unsafe { &*(ptr as *const CFNumber) };
+            let mut v: i64 = 0;
+            unsafe { num.value(CFNumberType(4), &mut v as *mut i64 as *mut _) };
+            Some(v)
+        };
+        if read_i64(get_val(&key_num)) == Some(window_id as i64) {
+            return read_i64(get_val(&key_pid)) == Some(pid as i64);
+        }
+    }
+    false
+}
+
 fn read_bounds_dict(dict_ptr: *const std::ffi::c_void) -> (f64, f64, f64, f64) {
     use std::ffi::c_void;
     use objc2_core_foundation::{CFNumber, CFNumberType, CFString as CFS};
