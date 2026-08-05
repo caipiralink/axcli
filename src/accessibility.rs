@@ -642,7 +642,14 @@ impl AXNode {
     pub fn app(pid: i32) -> Self {
         let element = unsafe { AXUIElement::new_application(pid) };
         enable_web_accessibility(&element);
-        if !has_web_area(&element, 0) && looks_chromium(&element, 0) {
+        // Order matters. `looks_chromium` reads a DOM class list at most four
+        // levels down and stops at the first hit, whereas `has_web_area`
+        // searches twelve levels for an element a native app never has — so on
+        // a native app it walks the whole tree before failing. Testing the
+        // cheap predicate first means a native app pays nothing: with a large
+        // document open in Word the pair cost ~15s in this order, and the
+        // conjunction is unchanged.
+        if looks_chromium(&element, 0) && !has_web_area(&element, 0) {
             settle_web_accessibility(&element, WEB_ACCESSIBILITY_SETTLE);
         }
         Self(element)
