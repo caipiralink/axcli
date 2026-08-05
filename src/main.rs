@@ -929,10 +929,10 @@ fn cmd_click(
             if activate {
                 eprintln!("warning: --activate is ignored for --strategy cg-pid (background by design)");
             }
-            let wid = match node.window_id() {
+            let wid = match resolve_event_window_id(&node, ctx.pid) {
                 Some(w) => w,
                 None => {
-                    eprintln!("debug: _AXUIElementGetWindow returned no CGWindowID for this element");
+                    eprintln!("debug: could not resolve a CGWindowID owned by pid {}", ctx.pid);
                     return Err(AxError::ActionFailed(
                         "could not find the window that owns this element".to_string(),
                     ));
@@ -986,6 +986,35 @@ fn cmd_click(
     }
 }
 
+/// Resolve the CGWindowID to tag background events with.
+///
+/// `_AXUIElementGetWindow` normally returns the right window, but for apps that
+/// render web content in a helper process it returns that helper's window while
+/// events are posted to the main process. `CGEventPostToPid` then fails to
+/// hit-test, silently. When the reported window is not owned by the target pid,
+/// fall back to matching the owning AX window's frame against the on-screen
+/// window list.
+fn resolve_event_window_id(node: &AXNode, pid: i32) -> Option<u32> {
+    let reported = node.window_id();
+    if let Some(wid) = reported
+        && accessibility::window_belongs_to_pid(wid, pid)
+    {
+        return Some(wid);
+    }
+
+    let window = find_owning_window(node)?;
+    let (wx, wy) = window.position()?;
+    let (ww, wh) = window.size()?;
+    let matched = accessibility::window_id_for_frame(pid, (wx, wy, ww, wh))?;
+    match reported {
+        Some(wid) => eprintln!(
+            "debug: window {wid} is not owned by pid {pid}; using {matched} matched by frame"
+        ),
+        None => eprintln!("debug: no CGWindowID from AX; using {matched} matched by frame"),
+    }
+    Some(matched)
+}
+
 /// Decide which click path to use when --strategy auto.
 ///
 /// Always cg-pid — background-safe, no focus steal, works on both
@@ -1004,7 +1033,7 @@ fn cmd_dblclick(ctx: &ExecutionContext, locator: &str) -> Result<(), AxError> {
         }
     }
 
-    let wid = match node.window_id() {
+    let wid = match resolve_event_window_id(&node, ctx.pid) {
         Some(w) => w,
         None => {
             return Err(AxError::ActionFailed(
@@ -1135,7 +1164,7 @@ fn cmd_scroll(ctx: &ExecutionContext, locator: &str, direction: &str, pixels: i3
     match resolved {
         ScrollStrategy::Auto => unreachable!(),
         ScrollStrategy::CgPid => {
-            let wid = match node.window_id() {
+            let wid = match resolve_event_window_id(&node, ctx.pid) {
                 Some(w) => w,
                 None => {
                     eprintln!("warning: no window ID, falling back to global scroll");
