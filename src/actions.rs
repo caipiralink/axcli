@@ -34,13 +34,18 @@ impl ExecutionContext {
 
     /// Resolve a locator to exactly one element.
     pub fn resolve_one(&self, locator: &str) -> Result<AXNode, AxError> {
-        let nodes = self.app.locate_all(locator);
+        // Two matches are enough: one to act on, one to prove ambiguity.
+        // The exact total is deliberately not computed — on a tree that
+        // materialises children on demand, counting the rest can cost tens of
+        // seconds to produce a number the caller cannot act on anyway.
+        let nodes = self.app.locate_limited(locator, 2);
         match nodes.len() {
             0 => Err(AxError::LocatorNotFound(locator.to_string())),
             1 => Ok(nodes.into_iter().next().unwrap()),
             n => Err(AxError::LocatorAmbiguous {
                 locator: locator.to_string(),
                 count: n,
+                at_least: true,
             }),
         }
     }

@@ -24,7 +24,7 @@
 //! let ok = btn.click();
 //! ```
 
-use crate::accessibility::{attr_string, children, find_all, AXNode, AXQuery};
+use crate::accessibility::{attr_string, children, find_all, find_limited, AXNode, AXQuery};
 use crate::error::AxError;
 use objc2_application_services::AXUIElement;
 use objc2_core_foundation::CFRetained;
@@ -284,14 +284,59 @@ impl Locator {
 
 const MAX_DEPTH: usize = 30;
 
+/// How many candidates a step must produce for the steps after it to be
+/// answerable.
+///
+/// Search steps are the expensive part of resolution: each one walks a subtree
+/// through the accessibility IPC boundary. When the caller only wants the first
+/// hit, or an `nth`/`first` step later discards everything else, collecting
+/// every match first is wasted work — and on an application that materialises
+/// accessibility children on demand it is the difference between milliseconds
+/// and tens of seconds.
+///
+/// `budget` is the number of candidates the *remaining* steps can consume:
+///
+/// - `Nth(n)` needs `n + 1` candidates and drops the rest.
+/// - `First` needs exactly one.
+/// - `Last`, `Filter` and any further search step can consume all of them, so
+///   the budget stays unbounded from that point backwards.
+///
+/// The final budget is supplied by the caller: `resolve` asks for 1,
+/// `resolve_one` asks for 2 so it can still detect ambiguity, and `resolve_all`
+/// asks for `usize::MAX`, which reproduces the previous behaviour exactly.
+fn budget_for(steps: &[LocatorStep], final_budget: usize) -> Vec<usize> {
+    let mut budgets = vec![usize::MAX; steps.len()];
+    let mut budget = final_budget;
+    for (i, step) in steps.iter().enumerate().rev() {
+        budgets[i] = budget;
+        budget = match step {
+            // Selection steps bound what the preceding step has to produce.
+            LocatorStep::Nth(n) => n.saturating_add(1),
+            LocatorStep::First => 1,
+            // Last and Filter both need to see every candidate to be correct,
+            // and a preceding search step feeds them directly.
+            LocatorStep::Last | LocatorStep::Filter(_) => usize::MAX,
+            // A search step consumes each candidate it is given, so the step
+            // before it must still produce all of them.
+            _ => usize::MAX,
+        };
+    }
+    budgets
+}
+
 impl Locator {
     /// Resolve all matching elements.
     pub fn resolve_all(&self) -> Vec<AXNode> {
+        self.resolve_with_budget(usize::MAX)
+    }
+
+    fn resolve_with_budget(&self, final_budget: usize) -> Vec<AXNode> {
         let root_node = AXNode::new(self.root.clone());
         let mut candidates = vec![root_node];
+        let budgets = budget_for(&self.steps, final_budget);
 
-        for step in &self.steps {
-            candidates = apply_step(step, candidates);
+        for (step, budget) in self.steps.iter().zip(budgets) {
+            candidates = apply_step(step, candidates, budget);
             if candidates.is_empty() {
                 return Vec::new();
             }
@@ -302,20 +347,22 @@ impl Locator {
 
     /// Resolve the first matching element.
     pub fn resolve(&self) -> Option<AXNode> {
-        self.resolve_all().into_iter().next()
+        self.resolve_with_budget(1).into_iter().next()
     }
 
     /// Resolve exactly one element.
     ///
     /// Returns `Err(LocatorNotFound)` if no matches, `Err(LocatorAmbiguous)` if more than one.
     pub fn resolve_one(&self) -> Result<AXNode, AxError> {
-        let results = self.resolve_all();
+        // Two is enough: one to return, one to prove ambiguity.
+        let results = self.resolve_with_budget(2);
         match results.len() {
             0 => Err(AxError::LocatorNotFound("Locator matched 0 elements".to_string())),
             1 => Ok(results.into_iter().next().unwrap()),
             n => Err(AxError::LocatorAmbiguous {
                 locator: format!("Locator({} steps)", self.steps.len()),
                 count: n,
+                at_least: true,
             }),
         }
     }
@@ -397,23 +444,28 @@ impl Locator {
 // Step evaluation
 // ---------------------------------------------------------------------------
 
-fn apply_step(step: &LocatorStep, candidates: Vec<AXNode>) -> Vec<AXNode> {
+fn apply_step(step: &LocatorStep, candidates: Vec<AXNode>, budget: usize) -> Vec<AXNode> {
     match step {
         // --- Factory steps: search within each candidate's subtree ---
         LocatorStep::Role(role) => {
             let q = AXQuery::new().role(role);
-            search_descendants(candidates, &q)
+            search_descendants(candidates, &q, budget)
         }
         LocatorStep::RoleWithName(role, name) => {
             let mut results = Vec::new();
             for c in &candidates {
                 let q = AXQuery::new().role(role);
+                // The name test happens after the role search, so the role
+                // search itself cannot be bounded by the caller's budget.
                 let matches = find_all(&c.0, &q, MAX_DEPTH);
                 for m in matches {
                     let t = attr_string(&m, "AXTitle").unwrap_or_default();
                     let d = attr_string(&m, "AXDescription").unwrap_or_default();
                     if t == *name || d == *name {
                         results.push(AXNode::new(m));
+                        if results.len() >= budget {
+                            return results;
+                        }
                     }
                 }
             }
@@ -421,31 +473,37 @@ fn apply_step(step: &LocatorStep, candidates: Vec<AXNode>) -> Vec<AXNode> {
         }
         LocatorStep::Text(text) => {
             let q = AXQuery::new().has_text(text);
-            search_descendants(candidates, &q)
+            search_descendants(candidates, &q, budget)
         }
         LocatorStep::Title(title) => {
             let q = AXQuery::new().title(title);
-            search_descendants(candidates, &q)
+            search_descendants(candidates, &q, budget)
         }
         LocatorStep::Description(desc) => {
             let mut results = Vec::new();
             for c in &candidates {
-                find_by_description(&c.0, desc, MAX_DEPTH, &mut results);
+                find_by_description(&c.0, desc, MAX_DEPTH, budget, &mut results);
+                if results.len() >= budget {
+                    break;
+                }
             }
             results
         }
         LocatorStep::DomId(id) => {
             let mut results = Vec::new();
             for c in &candidates {
-                find_by_dom_id(&c.0, id, MAX_DEPTH, &mut results);
+                find_by_dom_id(&c.0, id, MAX_DEPTH, budget, &mut results);
+                if results.len() >= budget {
+                    break;
+                }
             }
             results
         }
         LocatorStep::DomClass(class) => {
             let q = AXQuery::new().dom_class(class);
-            search_descendants(candidates, &q)
+            search_descendants(candidates, &q, budget)
         }
-        LocatorStep::Query(q) => search_descendants(candidates, q),
+        LocatorStep::Query(q) => search_descendants(candidates, q, budget),
 
         // --- Filter step ---
         LocatorStep::Filter(criteria) => candidates
@@ -460,10 +518,14 @@ fn apply_step(step: &LocatorStep, candidates: Vec<AXNode>) -> Vec<AXNode> {
     }
 }
 
-fn search_descendants(candidates: Vec<AXNode>, q: &AXQuery) -> Vec<AXNode> {
+fn search_descendants(candidates: Vec<AXNode>, q: &AXQuery, budget: usize) -> Vec<AXNode> {
     let mut results = Vec::new();
     for c in &candidates {
-        let matches = find_all(&c.0, q, MAX_DEPTH);
+        let remaining = budget.saturating_sub(results.len());
+        if remaining == 0 {
+            break;
+        }
+        let matches = find_limited(&c.0, q, MAX_DEPTH, remaining);
         results.extend(matches.into_iter().map(AXNode::new));
     }
     results
@@ -473,28 +535,47 @@ fn find_by_description(
     root: &AXUIElement,
     desc: &str,
     max_depth: usize,
+    limit: usize,
     results: &mut Vec<AXNode>,
 ) {
-    if max_depth == 0 {
+    if max_depth == 0 || results.len() >= limit {
         return;
     }
     for child in children(root) {
         if attr_string(&child, "AXDescription").as_deref() == Some(desc) {
             results.push(AXNode::new(child.clone()));
+            if results.len() >= limit {
+                return;
+            }
         }
-        find_by_description(&child, desc, max_depth - 1, results);
+        find_by_description(&child, desc, max_depth - 1, limit, results);
+        if results.len() >= limit {
+            return;
+        }
     }
 }
 
-fn find_by_dom_id(root: &AXUIElement, id: &str, max_depth: usize, results: &mut Vec<AXNode>) {
-    if max_depth == 0 {
+fn find_by_dom_id(
+    root: &AXUIElement,
+    id: &str,
+    max_depth: usize,
+    limit: usize,
+    results: &mut Vec<AXNode>,
+) {
+    if max_depth == 0 || results.len() >= limit {
         return;
     }
     for child in children(root) {
         if attr_string(&child, "AXDOMIdentifier").as_deref() == Some(id) {
             results.push(AXNode::new(child.clone()));
+            if results.len() >= limit {
+                return;
+            }
         }
-        find_by_dom_id(&child, id, max_depth - 1, results);
+        find_by_dom_id(&child, id, max_depth - 1, limit, results);
+        if results.len() >= limit {
+            return;
+        }
     }
 }
 

@@ -476,6 +476,53 @@ pub fn find_all(
     results
 }
 
+/// Find up to `limit` elements matching `query`, searching up to `max_depth`
+/// levels.
+///
+/// Traversal stops as soon as `limit` matches have been collected. On a small
+/// tree this is indistinguishable from [`find_all`], but on an application that
+/// materialises accessibility children on demand — Word and other document
+/// editors build one element per text run when asked — walking the whole tree
+/// to satisfy a query that only needs the first hit costs tens of seconds of
+/// IPC. A `limit` of `usize::MAX` is exactly [`find_all`].
+pub fn find_limited(
+    root: &AXUIElement,
+    query: &AXQuery,
+    max_depth: usize,
+    limit: usize,
+) -> Vec<CFRetained<AXUIElement>> {
+    let mut results = Vec::new();
+    if limit == 0 {
+        return results;
+    }
+    find_limited_inner(root, query, max_depth, limit, &mut results);
+    results
+}
+
+fn find_limited_inner(
+    root: &AXUIElement,
+    query: &AXQuery,
+    max_depth: usize,
+    limit: usize,
+    results: &mut Vec<CFRetained<AXUIElement>>,
+) -> bool {
+    if max_depth == 0 {
+        return false;
+    }
+    for child in children(root) {
+        if query.matches(&child) {
+            results.push(child.clone());
+            if results.len() >= limit {
+                return true;
+            }
+        }
+        if find_limited_inner(&child, query, max_depth - 1, limit, results) {
+            return true;
+        }
+    }
+    false
+}
+
 fn find_all_inner(
     root: &AXUIElement,
     query: &AXQuery,
@@ -695,6 +742,20 @@ impl AXNode {
     /// Find all elements matching a locator string (supports `>>` chains).
     pub fn locate_all(&self, locator: &str) -> Vec<AXNode> {
         resolve_locator_all(&self.0, locator)
+            .into_iter()
+            .map(AXNode::new)
+            .collect()
+    }
+
+    /// Find at most `limit` elements matching a locator string.
+    ///
+    /// Callers that only need to know "one match" or "more than one match" — a
+    /// uniqueness check before acting on an element, for instance — should ask
+    /// for the smallest number that answers the question. On an application
+    /// that materialises accessibility children on demand, that is the
+    /// difference between milliseconds and tens of seconds.
+    pub fn locate_limited(&self, locator: &str, limit: usize) -> Vec<AXNode> {
+        resolve_locator_limited(&self.0, locator, limit)
             .into_iter()
             .map(AXNode::new)
             .collect()
@@ -1630,21 +1691,38 @@ pub fn resolve_locator_all(
     root: &AXUIElement,
     locator: &str,
 ) -> Vec<CFRetained<AXUIElement>> {
+    resolve_locator_limited(root, locator, usize::MAX)
+}
+
+/// Resolve a locator, collecting at most `limit` final matches.
+///
+/// Each pipeline step is given the number of candidates the steps after it can
+/// actually consume, so a search stops early when the extra matches would be
+/// discarded anyway. `nth=N` needs `N + 1` candidates, `first` needs one, and
+/// `last`, a negative `nth`, or a following search step all need the full set.
+/// A `limit` of `usize::MAX` reproduces the unbounded behaviour exactly.
+pub fn resolve_locator_limited(
+    root: &AXUIElement,
+    locator: &str,
+    limit: usize,
+) -> Vec<CFRetained<AXUIElement>> {
     let steps = parse_locator_steps(locator);
 
     if steps.is_empty() {
         return Vec::new();
     }
 
+    let budgets = step_budgets(&steps, limit);
+
     // First step
     let mut current = match &steps[0] {
-        LocatorStep::Descendant(sel) => collect_matching(root, sel, 50),
+        LocatorStep::Descendant(sel) => collect_matching_limited(root, sel, 50, budgets[0]),
         LocatorStep::DirectChild(sel) => collect_direct_children_matching(root, sel),
     };
 
     // Pipeline: each subsequent step searches within current results
-    for step in &steps[1..] {
-        current = apply_step_typed(&current, step);
+    for (step, budget) in steps[1..].iter().zip(budgets[1..].iter().copied()) {
+        current = apply_step_typed(&current, step, budget);
         if current.is_empty() {
             break;
         }
@@ -1652,17 +1730,57 @@ pub fn resolve_locator_all(
     current
 }
 
+/// Work out how many candidates each step must produce.
+///
+/// Walking backwards: a selection step tells the step before it how few
+/// candidates are actually needed, while any step that has to see the whole set
+/// resets the budget to unbounded.
+fn step_budgets(steps: &[LocatorStep<'_>], final_budget: usize) -> Vec<usize> {
+    let mut budgets = vec![usize::MAX; steps.len()];
+    let mut budget = final_budget;
+    for (i, step) in steps.iter().enumerate().rev() {
+        budgets[i] = budget;
+        budget = match step {
+            LocatorStep::Descendant(sel) | LocatorStep::DirectChild(sel) => {
+                if let Some(n_str) = sel.strip_prefix("nth=") {
+                    match n_str.parse::<isize>() {
+                        // A negative index counts from the end, so every
+                        // candidate has to be collected first.
+                        Ok(n) if n >= 0 => (n as usize).saturating_add(1),
+                        _ => usize::MAX,
+                    }
+                } else if *sel == "first" {
+                    1
+                } else {
+                    // "last" and ordinary selectors both consume the whole set.
+                    usize::MAX
+                }
+            }
+        };
+    }
+    budgets
+}
+
 /// Apply a typed pipeline step (descendant or direct child).
-fn apply_step_typed(elements: &[CFRetained<AXUIElement>], step: &LocatorStep<'_>) -> Vec<CFRetained<AXUIElement>> {
+fn apply_step_typed(
+    elements: &[CFRetained<AXUIElement>],
+    step: &LocatorStep<'_>,
+    budget: usize,
+) -> Vec<CFRetained<AXUIElement>> {
     match step {
-        LocatorStep::Descendant(sel) => apply_step_inner(elements, sel, false),
-        LocatorStep::DirectChild(sel) => apply_step_inner(elements, sel, true),
+        LocatorStep::Descendant(sel) => apply_step_inner(elements, sel, false, budget),
+        LocatorStep::DirectChild(sel) => apply_step_inner(elements, sel, true, budget),
     }
 }
 
 /// Apply a single pipeline step to a set of elements.
 /// If `direct_only` is true, only search direct children (not descendants).
-fn apply_step_inner(elements: &[CFRetained<AXUIElement>], step: &str, direct_only: bool) -> Vec<CFRetained<AXUIElement>> {
+fn apply_step_inner(
+    elements: &[CFRetained<AXUIElement>],
+    step: &str,
+    direct_only: bool,
+    budget: usize,
+) -> Vec<CFRetained<AXUIElement>> {
     // nth=N — pick Nth element from current set (supports negative index)
     if let Some(n_str) = step.strip_prefix("nth=") {
         if let Ok(n) = n_str.parse::<isize>() {
@@ -1686,14 +1804,21 @@ fn apply_step_inner(elements: &[CFRetained<AXUIElement>], step: &str, direct_onl
     // Normal selector: search within each element
     let mut results = Vec::new();
     for el in elements {
+        let remaining = budget.saturating_sub(results.len());
+        if remaining == 0 {
+            break;
+        }
         if direct_only {
             for child in children(el) {
                 if element_matches_selector(&child, step) {
                     results.push(child);
+                    if results.len() >= budget {
+                        return results;
+                    }
                 }
             }
         } else {
-            collect_matching_inner(el, step, 50, &mut results);
+            collect_matching_inner(el, step, 50, budget, &mut results);
         }
     }
     results
@@ -1716,8 +1841,28 @@ pub fn collect_matching(
     selector: &str,
     max_depth: usize,
 ) -> Vec<CFRetained<AXUIElement>> {
+    collect_matching_limited(root, selector, max_depth, usize::MAX)
+}
+
+/// Collect up to `limit` elements matching a selector string (DFS).
+///
+/// Traversal stops as soon as `limit` matches have been collected. This matters
+/// because some applications build accessibility elements on demand: a document
+/// editor materialises one element per text run when the tree is walked, so a
+/// full DFS over an open document costs tens of seconds of IPC even when the
+/// caller only wants the first hit. A `limit` of `usize::MAX` is exactly
+/// [`collect_matching`].
+pub fn collect_matching_limited(
+    root: &AXUIElement,
+    selector: &str,
+    max_depth: usize,
+    limit: usize,
+) -> Vec<CFRetained<AXUIElement>> {
     let mut results = Vec::new();
-    collect_matching_inner(root, selector, max_depth, &mut results);
+    if limit == 0 {
+        return results;
+    }
+    collect_matching_inner(root, selector, max_depth, limit, &mut results);
     results
 }
 
@@ -1725,16 +1870,23 @@ fn collect_matching_inner(
     root: &AXUIElement,
     selector: &str,
     depth: usize,
+    limit: usize,
     results: &mut Vec<CFRetained<AXUIElement>>,
 ) {
-    if depth == 0 {
+    if depth == 0 || results.len() >= limit {
         return;
     }
     for child in children(root) {
         if element_matches_selector(&child, selector) {
             results.push(child.clone());
+            if results.len() >= limit {
+                return;
+            }
         }
-        collect_matching_inner(&child, selector, depth - 1, results);
+        collect_matching_inner(&child, selector, depth - 1, limit, results);
+        if results.len() >= limit {
+            return;
+        }
     }
 }
 
@@ -2005,6 +2157,75 @@ impl std::fmt::Debug for AXNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- step_budgets -----------------------------------------------------
+    //
+    // These pin the contract the search bound relies on: a step may only be
+    // cut short when the steps after it provably cannot use the extra
+    // matches. Getting this wrong changes results rather than just timing.
+
+    #[test]
+    fn budget_unbounded_request_stays_unbounded() {
+        let steps = parse_locator_steps("button >> nth=0");
+        let b = step_budgets(&steps, usize::MAX);
+        // Asking for every match must never bound an earlier step, otherwise
+        // locate_all would silently start returning fewer elements.
+        assert_eq!(b.last().copied(), Some(usize::MAX));
+    }
+
+    #[test]
+    fn budget_nth_needs_n_plus_one() {
+        let steps = parse_locator_steps("button >> nth=3");
+        let b = step_budgets(&steps, 1);
+        assert_eq!(b[0], 4, "nth=3 needs four candidates to pick the fourth");
+        assert_eq!(b[1], 1);
+    }
+
+    #[test]
+    fn budget_first_needs_one() {
+        let steps = parse_locator_steps("button >> first");
+        let b = step_budgets(&steps, 1);
+        assert_eq!(b[0], 1);
+    }
+
+    #[test]
+    fn budget_last_needs_everything() {
+        let steps = parse_locator_steps("button >> last");
+        let b = step_budgets(&steps, 1);
+        assert_eq!(
+            b[0],
+            usize::MAX,
+            "last can only be resolved once every candidate is known"
+        );
+    }
+
+    #[test]
+    fn budget_negative_nth_needs_everything() {
+        let steps = parse_locator_steps("button >> nth=-1");
+        let b = step_budgets(&steps, 1);
+        assert_eq!(
+            b[0],
+            usize::MAX,
+            "a negative index counts from the end, so nothing may be skipped"
+        );
+    }
+
+    #[test]
+    fn budget_search_step_needs_all_preceding_candidates() {
+        // Each candidate of the first step is a separate search root for the
+        // second, so the first step must still produce all of them.
+        let steps = parse_locator_steps("group >> button >> nth=0");
+        let b = step_budgets(&steps, 1);
+        assert_eq!(b[0], usize::MAX);
+        assert_eq!(b[1], 1);
+    }
+
+    #[test]
+    fn budget_final_request_propagates_to_last_step() {
+        let steps = parse_locator_steps("button");
+        assert_eq!(step_budgets(&steps, 2)[0], 2);
+        assert_eq!(step_budgets(&steps, 1)[0], 1);
+    }
 
     #[test]
     fn parse_exact_match() {
