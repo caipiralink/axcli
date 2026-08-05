@@ -847,7 +847,13 @@ fn cmd_snapshot(ctx: &ExecutionContext, locator: Option<&str>, depth: usize, all
 
     if let Some(loc) = locator {
         validate_locator(loc)?;
-        let nodes = ctx.app.locate_all(loc);
+        // Without --all only the first match is printed, so stop after two:
+        // the second is what tells the user more matches exist.
+        let nodes = if all {
+            ctx.app.locate_all(loc)
+        } else {
+            ctx.app.locate_limited(loc, 2)
+        };
         if nodes.is_empty() {
             return Err(AxError::LocatorNotFound(loc.to_string()));
         }
@@ -862,7 +868,7 @@ fn cmd_snapshot(ctx: &ExecutionContext, locator: Option<&str>, depth: usize, all
             let node = &nodes[0];
             if nodes.len() > 1 {
                 eprintln!(
-                    "Matched {} elements, showing first. Use --all to see all.",
+                    "Matched at least {} elements, showing first. Use --all to see all.",
                     nodes.len()
                 );
             }

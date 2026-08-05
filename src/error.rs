@@ -15,7 +15,13 @@ pub enum AxError {
     /// Locator matched zero elements.
     LocatorNotFound(String),
     /// Locator matched multiple elements when exactly one was expected.
-    LocatorAmbiguous { locator: String, count: usize },
+    ///
+    /// `count` is the number of matches actually collected, which may be a
+    /// lower bound: resolution stops early once ambiguity is proven, so it
+    /// does not pay to enumerate the rest. `at_least` records whether that
+    /// happened so the message can say "at least N" rather than claim a
+    /// total it did not compute.
+    LocatorAmbiguous { locator: String, count: usize, at_least: bool },
     /// Element has zero size (not visible on screen).
     ElementZeroSize,
     /// An AX action (e.g. AXPress) failed.
@@ -37,8 +43,13 @@ impl fmt::Display for AxError {
             Self::AppNotFound(name) => write!(f, "app not found: {name}"),
             Self::LocatorInvalid(msg) => write!(f, "invalid locator: {msg}"),
             Self::LocatorNotFound(loc) => write!(f, "locator not found: {loc}"),
-            Self::LocatorAmbiguous { locator, count } => {
-                write!(f, "locator matched {count} elements, must be unique for actions\nhint: use '{locator} >> nth=N' to select one")
+            Self::LocatorAmbiguous { locator, count, at_least } => {
+                let qty = if *at_least {
+                    format!("at least {count}")
+                } else {
+                    count.to_string()
+                };
+                write!(f, "locator matched {qty} elements, must be unique for actions\nhint: use '{locator} >> nth=N' to select one")
             }
             Self::ElementZeroSize => write!(f, "element has zero size (not visible)"),
             Self::ActionFailed(action) => write!(f, "{action} failed"),
@@ -98,9 +109,24 @@ mod tests {
         let e = AxError::LocatorAmbiguous {
             locator: "AXButton".to_string(),
             count: 3,
+            at_least: false,
         };
         let s = e.to_string();
         assert!(s.contains("3 elements"));
+        assert!(s.contains("nth=N"));
+    }
+
+    #[test]
+    fn display_locator_ambiguous_lower_bound() {
+        // Resolution stops as soon as ambiguity is proven, so the count is a
+        // floor rather than a total and the message must not imply otherwise.
+        let e = AxError::LocatorAmbiguous {
+            locator: "AXButton".to_string(),
+            count: 2,
+            at_least: true,
+        };
+        let s = e.to_string();
+        assert!(s.contains("at least 2 elements"), "got: {s}");
         assert!(s.contains("nth=N"));
     }
 
